@@ -71,7 +71,6 @@ import java.io.InputStream
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -110,7 +109,6 @@ class HttpReadAloudService : BaseReadAloudService(),
     private var speechRate: Int = AppConfig.speechRatePlay + 5
     private var downloadTask: Coroutine<*>? = null
     private var playIndexJob: Job? = null
-    private val downloadErrorNo = AtomicInteger(0)
     private var playErrorNo = 0
     private val downloadTaskActiveLock = Mutex()
     private val loadingState = MutableStateFlow(false)
@@ -264,31 +262,42 @@ class HttpReadAloudService : BaseReadAloudService(),
             downloadTaskActiveLock.withLock {
                 ensureActive()
                 val httpTts = ReadAloud.httpTTS ?: throw NoStackTraceException("tts is null")
+                // 尊重 TTS 源配置的并发率: 配置了 concurrentRate 时降为串行, 避免绕过限流语义
+                val concurrentRate = httpTts.concurrentRate
+                val concurrency =
+                    if (concurrentRate.isNullOrBlank() || concurrentRate == "0") ttsConcurrentDownload
+                    else 1
                 val downloaderChannel = Channel<Downloader>()
-                launch {
-                    for (downloader in downloaderChannel) {
-                        downloader.download(null)
+                repeat(concurrency) {
+                    launch {
+                        for (downloader in downloaderChannel) {
+                            downloader.download(null)
+                        }
                     }
                 }
-                contentList.forEachIndexed { index, content ->
-                    ensureActive()
-                    if (index < nowSpeak) return@forEachIndexed
-                    var text = content
-                    if (paragraphStartPos > 0 && index == nowSpeak) {
-                        text = text.substring(paragraphStartPos)
+                try {
+                    contentList.forEachIndexed { index, content ->
+                        ensureActive()
+                        if (index < nowSpeak) return@forEachIndexed
+                        var text = content
+                        if (paragraphStartPos > 0 && index == nowSpeak) {
+                            text = text.substring(paragraphStartPos)
+                        }
+                        val speakText = text.replace(AppPattern.notReadAloudRegex, "")
+                        if (speakText.isEmpty()) {
+                            AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$speakText")
+                        }
+                        val fileName = md5SpeakFileName(text)
+                        val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
+                        val mediaSource = createMediaSource(dataSourceFactory, fileName)
+                        launch(Main) {
+                            exoPlayer.addMediaSource(mediaSource)
+                        }
                     }
-                    val speakText = text.replace(AppPattern.notReadAloudRegex, "")
-                    if (speakText.isEmpty()) {
-                        AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$speakText")
-                    }
-                    val fileName = md5SpeakFileName(text)
-                    val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
-                    val mediaSource = createMediaSource(dataSourceFactory, fileName)
-                    launch(Main) {
-                        exoPlayer.addMediaSource(mediaSource)
-                    }
+                    preDownloadAudiosStream(httpTts, downloaderChannel)
+                } finally {
+                    downloaderChannel.close()
                 }
-                preDownloadAudiosStream(httpTts, downloaderChannel)
             }
         }.onError {
             AppLog.put("朗读下载出错\n${it.localizedMessage}", it, true)
@@ -306,9 +315,12 @@ class HttpReadAloudService : BaseReadAloudService(),
             .filter { it.isNotEmpty() }
             .toList()
         val flow = loadingState.debounce(1.seconds)
+        // 相同文本段落会算出同一缓存 key, 去重避免多路消费者并发写同一缓存
+        val downloaded = mutableSetOf<String>()
         contentList.forEach { content ->
             currentCoroutineContext().ensureActive()
             val fileName = md5SpeakFileName(content)
+            if (!downloaded.add(fileName)) return@forEach
             val speakText = content.replace(AppPattern.notReadAloudRegex, "")
             val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
             val downloader = createDownloader(dataSourceFactory, fileName)
@@ -369,6 +381,7 @@ class HttpReadAloudService : BaseReadAloudService(),
         httpTts: HttpTTS,
         speakText: String
     ): InputStream? {
+        var downloadErrorNo = 0
         while (true) {
             try {
                 val analyzeUrl = AnalyzeUrl(
@@ -402,7 +415,7 @@ class HttpReadAloudService : BaseReadAloudService(),
                 }
                 currentCoroutineContext().ensureActive()
                 response.body.byteStream().let { stream ->
-                    downloadErrorNo.set(0)
+                    downloadErrorNo = 0
                     return stream
                 }
             } catch (e: Exception) {
@@ -415,8 +428,8 @@ class HttpReadAloudService : BaseReadAloudService(),
                     }
 
                     is SocketTimeoutException, is ConnectException -> {
-                        downloadErrorNo.incrementAndGet()
-                        if (downloadErrorNo.get() > 5) {
+                        downloadErrorNo++
+                        if (downloadErrorNo > 5) {
                             val msg = "tts超时或连接错误超过5次\n${e.localizedMessage}"
                             AppLog.put(msg, e, true)
                             throw e
@@ -424,11 +437,11 @@ class HttpReadAloudService : BaseReadAloudService(),
                     }
 
                     else -> {
-                        downloadErrorNo.incrementAndGet()
+                        downloadErrorNo++
                         val msg = "tts下载错误\n${e.localizedMessage}"
                         AppLog.put(msg, e)
                         e.printOnDebug()
-                        if (downloadErrorNo.get() > 5) {
+                        if (downloadErrorNo > 5) {
                             val msg1 = "TTS服务器连续5次错误，已暂停阅读。"
                             AppLog.put(msg1, e, true)
                             throw e
