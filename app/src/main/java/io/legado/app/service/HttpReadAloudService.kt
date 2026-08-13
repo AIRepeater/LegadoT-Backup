@@ -238,7 +238,7 @@ class HttpReadAloudService : BaseReadAloudService(),
             .toList()
         contentList.forEach { content ->
             currentCoroutineContext().ensureActive()
-            val fileName = md5SpeakFileName(content)
+            val fileName = md5SpeakFileName(content, textChapter)
             val speakText = content.replace(AppPattern.notReadAloudRegex, "")
             if (speakText.isEmpty()) {
                 createSilentSound(fileName)
@@ -319,7 +319,7 @@ class HttpReadAloudService : BaseReadAloudService(),
         val downloaded = mutableSetOf<String>()
         contentList.forEach { content ->
             currentCoroutineContext().ensureActive()
-            val fileName = md5SpeakFileName(content)
+            val fileName = md5SpeakFileName(content, textChapter)
             if (!downloaded.add(fileName)) return@forEach
             val speakText = content.replace(AppPattern.notReadAloudRegex, "")
             val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
