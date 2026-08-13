@@ -323,7 +323,7 @@ class HttpReadAloudService : BaseReadAloudService(),
     ): CacheDataSource.Factory {
         // 同一段落的流与重放缓冲在多次 open 间共享,
         // MediaParser 嗅探后重新 open 时从缓冲重放, 避免对 TTS 服务器重复请求
-        val replayBuffer = ReplayBuffer {
+        val replayBuffer = ReplayBuffer(supplier = {
             if (speakText.isEmpty()) {
                 null
             } else {
@@ -340,7 +340,7 @@ class HttpReadAloudService : BaseReadAloudService(),
                     }
                 }.getOrThrow()
             } ?: resources.openRawResource(R.raw.silent_sound)
-        }
+        })
         val upstreamFactory = DataSource.Factory {
             InputStreamDataSource({ replayBuffer.stream() }, replayBuffer)
         }
