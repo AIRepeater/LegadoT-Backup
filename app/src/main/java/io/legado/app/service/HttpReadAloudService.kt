@@ -291,23 +291,38 @@ class HttpReadAloudService : BaseReadAloudService(),
                 // 相同文本段落会算出同一缓存 key, 去重避免并发写同一缓存
                 val downloadedKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
                 try {
-                    // 本章播放: 并行下载(保序交付), 完成后逐个加入播放器,
-                    // 使播放时直接命中缓存, 避免 ExoPlayer 按需串行请求 TTS 服务器
+                    // 当前段立即入列表保证及时起播, 由播放器按需加载并写入缓存;
+                    // 后续段先下载后按序入列表, 避免播放器预取与下载池并发写同一缓存 key
+                    contentList.getOrNull(nowSpeak)?.let { content ->
+                        var text = content
+                        if (paragraphStartPos > 0) {
+                            text = text.substring(paragraphStartPos)
+                        }
+                        val speakText = text.replace(AppPattern.notReadAloudRegex, "")
+                        if (speakText.isEmpty()) {
+                            AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$text")
+                        }
+                        val fileName = md5SpeakFileName(text)
+                        // 预留当前段缓存 key, 后续重复段落不投下载池, 避免与播放加载并发写同一缓存
+                        downloadedKeys.add(fileName)
+                        val mediaSource = createMediaSource(
+                            createDataSourceFactory(httpTts, speakText), fileName
+                        )
+                        launch(Main) {
+                            exoPlayer.addMediaSource(mediaSource)
+                        }
+                    }
                     contentList.asFlow()
                         .mapAsyncIndexed(concurrency) { index, content ->
                             ensureActive()
-                            if (index < nowSpeak) return@mapAsyncIndexed null
-                            var text = content
-                            if (paragraphStartPos > 0 && index == nowSpeak) {
-                                text = text.substring(paragraphStartPos)
-                            }
-                            val speakText = text.replace(AppPattern.notReadAloudRegex, "")
+                            if (index <= nowSpeak) return@mapAsyncIndexed null
+                            val speakText = content.replace(AppPattern.notReadAloudRegex, "")
                             if (speakText.isEmpty()) {
-                                AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$text")
+                                AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$content")
                             }
-                            val fileName = md5SpeakFileName(text)
+                            val fileName = md5SpeakFileName(content)
                             val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
-                            if (downloadedKeys.add(fileName)) {
+                            if (speakText.isNotEmpty() && downloadedKeys.add(fileName)) {
                                 try {
                                     createDownloader(dataSourceFactory, fileName).download(null)
                                 } catch (e: CancellationException) {
@@ -353,7 +368,7 @@ class HttpReadAloudService : BaseReadAloudService(),
             if (!downloaded.add(fileName)) return@forEach
             val speakText = content.replace(AppPattern.notReadAloudRegex, "")
             val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
-            // 投递到并行下载池, rendezvous channel 天然限流, 无需用播放加载状态门控
+            // 投递到并行下载池, 在途下载数由消费者数限制, 无需用播放加载状态门控
             downloaderChannel.send(createDownloader(dataSourceFactory, fileName))
         }
     }
