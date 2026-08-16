@@ -36,46 +36,61 @@ class ReplayBuffer(
     private var captureFinished = false
     private var eofReached = false
     private var replayStarted = false
-    // 已从底层流成功接收的字节数, 中断重建时据此跳过已收部分实现断点续传
-    private var consumedBytes = 0L
+    // 底层流绝对已消费位置, 中断重建与缺口定位均据此跳过已收部分
+    var consumedBytes = 0L
+        private set
 
     /**
-     * 获取共享底层流, 首次调用或中断重建时才真正发起网络请求;
-     * 重建时跳过已成功接收的字节, 从断点继续
+     * 获取定位到绝对字节偏移 [position] 的共享底层流:
+     * 现有流可前进时直接在流上跳过差额;
+     * 目标位置落后或无现有流时重建新流并从头跳过, 续传与缓存缺口定位共用此入口,
+     * 避免内部跳过与调用方跳过两套记账叠加
      */
-    fun stream(): InputStream {
-        stream?.let { return it }
+    fun streamAt(position: Long): InputStream {
+        val existing = stream
+        if (existing != null && position >= consumedBytes) {
+            skipFully(existing, position - consumedBytes)
+            consumedBytes = position
+            return existing
+        }
+        if (existing != null) kotlin.runCatching { existing.close() }
+        // 目标位置落后于已消费位置: 旧捕获缓冲不再对应新流 [0..] 区间, 重置避免重放错乱
+        if (position < consumedBytes) resetCapture()
         val newStream = supplier.invoke()
-        if (consumedBytes > 0) {
-            try {
-                skipFully(newStream, consumedBytes)
-            } catch (e: IOException) {
-                kotlin.runCatching { newStream.close() }
-                throw e
-            }
+        try {
+            skipFully(newStream, position)
+        } catch (e: IOException) {
+            kotlin.runCatching { newStream.close() }
+            throw e
         }
         stream = newStream
+        consumedBytes = position
         return newStream
     }
 
-    /** 记录从底层流成功读取的字节数, 用于中断续传时定位断点 */
+    /** 记录从底层流成功读取的字节数, 使 consumedBytes 始终等于底层流绝对已消费位置 */
     fun noteBytesRead(count: Int) {
         consumedBytes += count
     }
 
-    /** 记录 open 阶段跳过(position)的字节, 使 consumedBytes 始终等于底层流绝对已消费位置 */
-    fun noteBytesSkipped(count: Long) {
-        consumedBytes += count
-    }
-
-    /** 底层流读取失败时废弃当前流, 下次 stream() 重建并续传 */
+    /** 底层流读取失败时废弃当前流, 下次 streamAt() 重建并续传 */
     fun invalidateStream() {
         kotlin.runCatching { stream?.close() }
         stream = null
     }
 
+    /** 重建到更早位置时重置捕获/重放状态, 使捕获缓冲始终对应新流从 0 起的字节 */
+    private fun resetCapture() {
+        captured.reset()
+        replayOffset = 0
+        captureFinished = false
+        replayStarted = false
+        eofReached = false
+    }
+
     /** 跳过指定字节数; skip 不生效的流退化为读取丢弃, 字节不足时抛 EOFException */
     private fun skipFully(input: InputStream, count: Long) {
+        if (count <= 0) return
         var remaining = count
         val buffer = ByteArray(SKIP_BUFFER_SIZE)
         while (remaining > 0) {
@@ -156,7 +171,7 @@ class InputStreamDataSource(
     // 连续续传失败计数: 成功读取后归零, 超过上限才向上抛出, 避免持续抖动导致无限重试
     private var consecutiveResumeFailures = 0
     private val inputStream: InputStream by lazy {
-        replayBuffer?.stream() ?: supplier.invoke()
+        replayBuffer?.streamAt(0) ?: supplier.invoke()
     }
 
     @Throws(IOException::class)
@@ -169,10 +184,12 @@ class InputStreamDataSource(
             replayBuffer.startReplay()
             replaying = true
         } else {
-            // 统一走共享缓冲的底层流, 支持流关闭后按需重建
-            val stream = replayBuffer?.stream() ?: inputStream
-            val skipped = stream.skip(dataSpec.position)
-            if (skipped > 0) replayBuffer?.noteBytesSkipped(skipped)
+            // 定位统一由共享缓冲按绝对偏移完成, 无缓冲时自行跳足(skip 不保证一次跳满)
+            if (replayBuffer != null) {
+                replayBuffer.streamAt(dataSpec.position)
+            } else {
+                skipFully(inputStream, dataSpec.position)
+            }
         }
 
         bytesRemaining = dataSpec.length
@@ -230,7 +247,8 @@ class InputStreamDataSource(
         val replayBuffer = replayBuffer ?: return inputStream.read(buffer, offset, length)
         while (true) {
             try {
-                val stream = replayBuffer.stream()
+                // 从已消费的绝对位置重建并续传
+                val stream = replayBuffer.streamAt(replayBuffer.consumedBytes)
                 val bytesRead = stream.read(buffer, offset, length)
                 if (bytesRead == -1) {
                     replayBuffer.markEof()
@@ -242,7 +260,7 @@ class InputStreamDataSource(
                 consecutiveResumeFailures = 0
                 return bytesRead
             } catch (e: IOException) {
-                // 先废弃已损坏的流, 下次 stream() 重建并续传
+                // 先废弃已损坏的流, 下次 streamAt() 重建并续传
                 replayBuffer.invalidateStream()
                 if (++consecutiveResumeFailures > MAX_RESUME_ATTEMPTS) {
                     consecutiveResumeFailures = 0
@@ -253,6 +271,23 @@ class InputStreamDataSource(
                     "TTS音频流中断, 第${consecutiveResumeFailures}次断点续传\n${e.localizedMessage}", e
                 )
             }
+        }
+    }
+
+    /** 跳过指定字节数; skip 不生效的流退化为读取丢弃, 字节不足时抛 EOFException */
+    private fun skipFully(input: InputStream, count: Long) {
+        if (count <= 0) return
+        var remaining = count
+        val buffer = ByteArray(8 * 1024)
+        while (remaining > 0) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0) {
+                remaining -= skipped
+                continue
+            }
+            val read = input.read(buffer, 0, min(remaining, buffer.size.toLong()).toInt())
+            if (read == -1) throw EOFException("定位失败: 响应的字节数不足")
+            remaining -= read
         }
     }
 
