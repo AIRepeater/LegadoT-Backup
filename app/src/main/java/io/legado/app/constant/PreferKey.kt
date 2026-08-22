@@ -152,6 +152,7 @@ object PreferKey {
     const val updateToVariant = "updateToVariant"
     const val streamReadAloudAudio = "streamReadAloudAudio"
     const val ttsPreDownloadChapterNum = "ttsPreDownloadChapterNum"
+    const val ttsCacheSize = "ttsCacheSize"
     const val pauseReadAloudWhilePhoneCalls = "pauseReadAloudWhilePhoneCalls"
     const val readAloudByMediaButton = "readAloudByMediaButton"
     const val devFeat = "devFeat"

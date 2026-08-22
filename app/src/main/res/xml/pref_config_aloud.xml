@@ -79,6 +79,12 @@
             android:key="clearTtsCache"
             app:iconSpaceReserved="false" />
 
+        <io.legado.app.lib.prefs.Preference
+            android:title="@string/tts_cache_size"
+            android:summary="@string/tts_cache_size_s"
+            android:key="ttsCacheSize"
+            app:iconSpaceReserved="false" />
+
     </io.legado.app.lib.prefs.PreferenceCategory>
 
 </androidx.preference.PreferenceScreen>

@@ -72,6 +72,7 @@ class ReadAloudConfigDialog : BasePrefDialogFragment() {
             addPreferencesFromResource(R.xml.pref_config_aloud)
             upSpeakEngineSummary()
             upTtsPreDownloadSummary()
+            upTtsCacheSizeSummary()
             findPreference<SwitchPreference>(PreferKey.pauseReadAloudWhilePhoneCalls)?.let {
                 it.isEnabled = AppConfig.ignoreAudioFocus
             }
@@ -103,6 +104,13 @@ class ReadAloudConfigDialog : BasePrefDialogFragment() {
                 ) {
                     AppConfig.ttsPreDownloadChapterNum = it
                 }
+                PreferKey.ttsCacheSize -> showNumberPicker(
+                    requireContext(),
+                    titleResId = R.string.tts_cache_size,
+                    max = 1024, min = 64, value = AppConfig.ttsCacheSize
+                ) {
+                    AppConfig.ttsCacheSize = it
+                }
                 "clearTtsCache" -> showClearTtsCacheDialog()
             }
             return super.onPreferenceTreeClick(preference)
@@ -126,6 +134,7 @@ class ReadAloudConfigDialog : BasePrefDialogFragment() {
                 }
 
                 PreferKey.ttsPreDownloadChapterNum -> upTtsPreDownloadSummary()
+                PreferKey.ttsCacheSize -> upTtsCacheSizeSummary()
             }
         }
 
@@ -136,6 +145,13 @@ class ReadAloudConfigDialog : BasePrefDialogFragment() {
                     R.string.tts_pre_download_s,
                     AppConfig.ttsPreDownloadChapterNum.toString()
                 )
+            )
+        }
+
+        private fun upTtsCacheSizeSummary() {
+            upPreferenceSummary(
+                findPreference(PreferKey.ttsCacheSize),
+                getString(R.string.tts_cache_size_s, AppConfig.ttsCacheSize.toString())
             )
         }
 

@@ -1021,6 +1021,8 @@
     <string name="clear_tts_cache">Clear TTS cache</string>
     <string name="clear_tts_cache_summary">Delete cached online read-aloud audio</string>
     <string name="clear_tts_cache_confirm">This will delete all cached online read-aloud audio, stopping online read-aloud if in progress. Continue?</string>
+    <string name="tts_cache_size">TTS cache size</string>
+    <string name="tts_cache_size_s">Online read-aloud audio cache limit: %s MB</string>
     <string name="cannot_timed_non_playback">When the non-playback state is not legal</string>
     <string name="all_bookmark">All bookmarks</string>
     <string name="change_source_batch">Batch source switching</string>

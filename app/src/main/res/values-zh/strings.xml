@@ -1016,6 +1016,8 @@
     <string name="clear_tts_cache">清除朗读缓存</string>
     <string name="clear_tts_cache_summary">删除已缓存的在线朗读音频</string>
     <string name="clear_tts_cache_confirm">将删除全部已缓存的在线朗读音频，正在在线朗读时将停止朗读，是否继续？</string>
+    <string name="tts_cache_size">朗读缓存大小</string>
+    <string name="tts_cache_size_s">在线朗读音频缓存上限 %s MB</string>
     <string name="cannot_timed_non_playback">非播放状态无法定时</string>
     <string name="all_bookmark">所有书签</string>
     <string name="change_source_batch">批量换源</string>

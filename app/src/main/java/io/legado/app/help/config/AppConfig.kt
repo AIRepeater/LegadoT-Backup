@@ -248,6 +248,9 @@ object AppConfig : SharedPreferences.OnSharedPreferenceChangeListener {
 
     /** 在线朗读预下载章数, 0 为仅预下载下一章开头(历史行为) */
     var ttsPreDownloadChapterNum by intPref(PreferKey.ttsPreDownloadChapterNum, 0, 0..50)
+
+    /** 在线朗读音频缓存上限(MB), 下次创建朗读服务时生效 */
+    var ttsCacheSize by intPref(PreferKey.ttsCacheSize, 256, 64..1024)
     val doublePageHorizontal by stringPref(PreferKey.doublePageHorizontal)
     val progressBarBehavior by stringPref(PreferKey.progressBarBehavior, "page")
     val volumeKeyPage by boolPref(PreferKey.volumeKeyPage, true)
