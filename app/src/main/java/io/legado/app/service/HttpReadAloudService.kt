@@ -2,7 +2,6 @@ package io.legado.app.service
 
 import android.annotation.SuppressLint
 import android.app.PendingIntent
-import android.net.Uri
 import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
@@ -30,8 +29,10 @@ import io.legado.app.R
 import io.legado.app.constant.AppConst
 import io.legado.app.constant.AppLog
 import io.legado.app.constant.AppPattern
+import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.HttpTTS
 import io.legado.app.exception.NoStackTraceException
+import io.legado.app.help.book.BookHelp
 import io.legado.app.help.config.AppConfig
 import io.legado.app.help.coroutine.Coroutine
 import io.legado.app.help.exoplayer.InputStreamDataSource
@@ -40,7 +41,9 @@ import io.legado.app.help.http.okHttpClient
 import io.legado.app.model.ReadAloud
 import io.legado.app.model.ReadBook
 import io.legado.app.model.analyzeRule.AnalyzeUrl
+import io.legado.app.model.webBook.WebBook
 import io.legado.app.ui.book.read.page.entities.TextChapter
+import io.legado.app.ui.book.read.page.provider.ChapterProvider
 import io.legado.app.utils.FileUtils
 import io.legado.app.utils.MD5Utils
 import io.legado.app.utils.mapAsyncIndexed
@@ -48,6 +51,7 @@ import io.legado.app.utils.printOnDebug
 import io.legado.app.utils.servicePendingIntent
 import io.legado.app.utils.toastOnUi
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers.Main
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -64,6 +68,7 @@ import org.mozilla.javascript.WrappedException
 import splitties.init.appCtx
 import java.io.File
 import java.io.InputStream
+import java.io.InterruptedIOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.util.Collections
@@ -86,13 +91,10 @@ class HttpReadAloudService : BaseReadAloudService(),
             ).build()
         ).build()
     }
-    private val ttsFolderPath: String by lazy {
-        cacheDir.absolutePath + File.separator + "httpTTS" + File.separator
-    }
     private val cache by lazy {
         SimpleCache(
             File(cacheDir, "httpTTS_cache"),
-            LeastRecentlyUsedCacheEvictor(128 * 1024 * 1024),
+            LeastRecentlyUsedCacheEvictor(ttsCacheMaxBytes),
             StandaloneDatabaseProvider(appCtx)
         )
     }
@@ -109,6 +111,8 @@ class HttpReadAloudService : BaseReadAloudService(),
     private var playErrorNo = 0
     // 服务级"连续下载失败"熔断计数: 跨段落累计, 成功时清零
     private val downloadErrorNo = AtomicInteger(0)
+    // 预下载失败熔断计数: 每轮任务清零, 达阈值中止本轮预下载, 避免持续故障下逐段空请求
+    private val preDownloadErrorNo = AtomicInteger(0)
     private val downloadTaskActiveLock = Mutex()
     // 从段落中间起播时, 完整段音频就绪后需 seek 到的估算位置
     private var pendingSeekMs = C.TIME_UNSET
@@ -122,21 +126,71 @@ class HttpReadAloudService : BaseReadAloudService(),
     companion object {
         /** TTS 段落并行下载并发数 */
         private const val ttsConcurrentDownload = 4
+
+        /** TTS 音频缓存上限, 缓存生命周期统一由 LRU 管理 */
+        private const val ttsCacheMaxBytes = 256L * 1024 * 1024
+
+        /** 预下载连续失败熔断阈值 */
+        private const val ttsPreDownloadErrorLimit = 5
+
+        /** 清除缓存请求有效时限: stopService 到 onDestroy 通常毫秒级, 超时视为悬挂请求忽略 */
+        private const val clearCacheRequestTimeoutMs = 60_000L
+
+        /** 设置页发起的清除缓存请求时间戳(ms); 服务销毁释放缓存后据此执行删除 */
+        @Volatile
+        var clearCacheRequestedAt = 0L
+
+        /** 服务实例存活标记: 供设置页判断在线朗读服务是否正持有缓存句柄 */
+        @Volatile
+        var isRunning = false
+            private set
+
+        /** 服务未运行时由设置页调用: 异步清理全部 TTS 缓存目录 */
+        fun clearTtsCacheDirsAsync(onCleared: (() -> Unit)? = null) {
+            Coroutine.async {
+                // 旧版非流式文件缓存目录不再使用, 无索引库, 直接删除
+                FileUtils.delete(File(appCtx.cacheDir, "httpTTS").absolutePath)
+                deleteSimpleCacheDir("httpTTS_cache")
+                onCleared?.invoke()
+            }
+        }
+
+        /** 先整体改名再删除: 与新服务实例在同目录重建缓存互斥; 经 SimpleCache.delete 连同索引库一并清理 */
+        private fun deleteSimpleCacheDir(name: String) {
+            val dir = File(appCtx.cacheDir, name)
+            if (!dir.exists()) return
+            val trash = File(appCtx.cacheDir, "$name.trash.${System.currentTimeMillis()}")
+            SimpleCache.delete(
+                if (dir.renameTo(trash)) trash else dir,
+                StandaloneDatabaseProvider(appCtx)
+            )
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         exoPlayer.addListener(this)
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        isRunning = false
         downloadTask?.cancel()
         cancelActiveDownloaders()
         exoPlayer.release()
         cache.release()
         Coroutine.async {
-            removeCacheFile()
+            // 旧版非流式文件缓存目录不再使用, 顺带清理
+            FileUtils.delete(File(appCtx.cacheDir, "httpTTS").absolutePath)
+            // 设置页发起的清缓存请求: 此时缓存已释放, 删除目录与索引库, 下次启动自动重建
+            if (clearCacheRequestedAt != 0L
+                && System.currentTimeMillis() - clearCacheRequestedAt <= clearCacheRequestTimeoutMs
+            ) {
+                clearCacheRequestedAt = 0L
+                deleteSimpleCacheDir("httpTTS_cache")
+                appCtx.toastOnUi(R.string.clear_cache_success)
+            }
         }
     }
 
@@ -206,8 +260,12 @@ class HttpReadAloudService : BaseReadAloudService(),
                 val taskJob = currentCoroutineContext()[Job]
                 val httpTts = ReadAloud.httpTTS ?: throw NoStackTraceException("tts is null")
                 val concurrency = resolveConcurrency(httpTts.concurrentRate)
-                // 相同文本段落会算出同一文件名, 按文件名加锁避免并发写坏同一文件
-                val writingLocks = ConcurrentHashMap<String, Mutex>()
+                // 切换章节时重置跨任务 key 集合
+                val title = textChapter?.title ?: ""
+                if (downloadedKeysTitle != title) {
+                    downloadedKeys.clear()
+                    downloadedKeysTitle = title
+                }
                 // 并行下载(保序交付), 避免长段落顺序请求导致等待
                 contentList.asFlow()
                     .mapAsyncIndexed(concurrency) { index, content ->
@@ -216,70 +274,52 @@ class HttpReadAloudService : BaseReadAloudService(),
                         // 缓存 key 始终用完整段落文本, 保证前后跳段时一致
                         val fileName = md5SpeakFileName(content)
                         val speakText = content.replace(AppPattern.notReadAloudRegex, "")
+                        val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
                         if (speakText.isEmpty()) {
+                            // 空段落不预下载, 播放时经数据源按需写入无声音频
                             AppLog.put("阅读段落内容为空，使用无声音频代替。\n朗读文本：$content")
-                            createSilentSound(fileName)
-                        } else {
-                            writingLocks.getOrPut(fileName) { Mutex() }.withLock {
-                                if (!hasSpeakFile(fileName)) {
-                                    runCatching {
-                                        val inputStream = getSpeakStream(httpTts, speakText)
-                                        if (inputStream != null) {
-                                            createSpeakFile(fileName, inputStream)
-                                        } else {
-                                            createSilentSound(fileName)
-                                        }
-                                    }.onFailure {
-                                        if (it !is CancellationException) {
-                                            // 规则错误/重试超限等持续故障: 保留原"暂停阅读"契约
-                                            pauseReadAloud()
-                                        }
-                                        throw it
-                                    }
+                        } else if (downloadedKeys.add(fileName)) {
+                            try {
+                                downloadTrack(fileName, createDownloader(dataSourceFactory, fileName))
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                // 规则错误/重试超限等持续故障: 保留原"失败暂停阅读并终止任务"契约
+                                if (taskJob?.isActive == true) {
+                                    downloadedKeys.remove(fileName)
                                 }
+                                pauseReadAloud()
+                                throw e
                             }
                         }
-                        fileName
-                    }.collect { fileName ->
-                        if (fileName == null) return@collect
-                        val file = getSpeakFileAsMd5(fileName)
-                        val mediaItem = MediaItem.fromUri(Uri.fromFile(file))
+                        fileName to dataSourceFactory
+                    }.collect { result ->
+                        if (result == null) return@collect
+                        val (fileName, dataSourceFactory) = result
+                        val mediaSource = createMediaSource(dataSourceFactory, fileName)
                         launch(Main) {
                             // 任务已被取消时丢弃入列, 避免陈旧段落插回重建后的播放列表
                             if (taskJob?.isActive != true) return@launch
-                            exoPlayer.addMediaItem(mediaItem)
+                            exoPlayer.addMediaSource(mediaSource)
                         }
                     }
-                preDownloadAudios(httpTts)
-            }
-        }.onError {
-            AppLog.put("朗读下载出错\n${it.localizedMessage}", it, true)
-        }
-    }
-
-    private suspend fun preDownloadAudios(httpTts: HttpTTS) {
-        val textChapter = ReadBook.nextTextChapter ?: return
-        val contentList = textChapter.getNeedReadAloud(0, readAloudByPage, 0, 1)
-            .splitToSequence("\n")
-            .filter { it.isNotEmpty() }
-            .take(10)
-            .toList()
-        contentList.forEach { content ->
-            currentCoroutineContext().ensureActive()
-            val fileName = md5SpeakFileName(content, textChapter)
-            val speakText = content.replace(AppPattern.notReadAloudRegex, "")
-            if (speakText.isEmpty()) {
-                createSilentSound(fileName)
-            } else if (!hasSpeakFile(fileName)) {
-                runCatching {
-                    val inputStream = getSpeakStream(httpTts, speakText)
-                    if (inputStream != null) {
-                        createSpeakFile(fileName, inputStream)
-                    } else {
-                        createSilentSound(fileName)
+                preDownloadAudios(httpTts) { fileName, downloader ->
+                    try {
+                        downloadTrack(fileName, downloader)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // 预下载失败不暂停朗读, 释放 key 供后续任务重试
+                        if (taskJob?.isActive == true) {
+                            downloadedKeys.remove(fileName)
+                        }
+                        preDownloadErrorNo.incrementAndGet()
+                        AppLog.put("TTS预下载出错\n${e.localizedMessage}", e)
                     }
                 }
             }
+        }.onError {
+            AppLog.put("朗读下载出错\n${it.localizedMessage}", it, true)
         }
     }
 
@@ -312,7 +352,11 @@ class HttpReadAloudService : BaseReadAloudService(),
                             } catch (e: Exception) {
                                 // 单段失败容错, 释放 key 供后续任务重试, 避免一个段落异常取消全部并行下载
                                 if (taskJob?.isActive == true) downloadedKeys.remove(fileName)
-                                AppLog.put("TTS预下载出错\n${e.localizedMessage}", e)
+                                // 任务重建显式取消在途下载产生中断异常, 不计入熔断计数
+                                if (e !is InterruptedException && e !is InterruptedIOException) {
+                                    preDownloadErrorNo.incrementAndGet()
+                                    AppLog.put("TTS预下载出错\n${e.localizedMessage}", e)
+                                }
                             }
                         }
                     }
@@ -375,7 +419,10 @@ class HttpReadAloudService : BaseReadAloudService(),
                                 exoPlayer.addMediaSource(mediaSource)
                             }
                         }
-                    preDownloadAudiosStream(httpTts, downloaderChannel)
+                    preDownloadAudios(httpTts) { fileName, downloader ->
+                        // 投递到并行下载池, 在途下载数由消费者数限制, 无需用播放加载状态门控
+                        downloaderChannel.send(fileName to downloader)
+                    }
                 } finally {
                     downloaderChannel.close()
                 }
@@ -407,30 +454,91 @@ class HttpReadAloudService : BaseReadAloudService(),
         }
     }
 
-    private suspend fun preDownloadAudiosStream(
+    /**
+     * 预下载后续章节音频
+     * 预下载章数 N(AppConfig.ttsPreDownloadChapterNum):
+     * N=0 时仅预下载下一章开头(前2页), 且沿用历史行为, 下一章未就绪时直接跳过;
+     * N>0 时完整预下载后续 N 章音频, 并对第 N+1 章预下载开头。
+     * 由远及近倒序下载, 避免缓存逼近上限时 LRU 把临近章节先行逐出。
+     * @param submit 段落下载投递: 流式发往并行下载池, 非流式顺序执行
+     */
+    private suspend fun CoroutineScope.preDownloadAudios(
         httpTts: HttpTTS,
-        downloaderChannel: Channel<Pair<String, Downloader>>
+        submit: suspend (fileName: String, downloader: Downloader) -> Unit
     ) {
-        val textChapter = ReadBook.nextTextChapter ?: return
-        val contentList = textChapter.getNeedReadAloud(0, readAloudByPage, 0, 1)
-            .splitToSequence("\n")
-            .filter { it.isNotEmpty() }
-            .toList()
-        // 相同文本段落会算出同一缓存 key, 跨任务去重避免重复下载
-        contentList.forEach { content ->
-            currentCoroutineContext().ensureActive()
-            val fileName = md5SpeakFileName(content, textChapter)
-            val speakText = content.replace(AppPattern.notReadAloudRegex, "")
-            if (speakText.isEmpty() || !downloadedKeys.add(fileName)) return@forEach
-            val dataSourceFactory = createDataSourceFactory(httpTts, speakText)
-            // 投递到并行下载池, 在途下载数由消费者数限制, 无需用播放加载状态门控
-            downloaderChannel.send(fileName to createDownloader(dataSourceFactory, fileName))
+        val preDownloadNum = AppConfig.ttsPreDownloadChapterNum
+        val book = ReadBook.book ?: return
+        val baseIndex = ReadBook.durChapterIndex
+        val nextTextChapter = ReadBook.nextTextChapter
+        preDownloadErrorNo.set(0)
+        for (offset in preDownloadNum + 1 downTo 1) {
+            ensureActive()
+            // 循环期间用户切章则放弃本轮, 由新任务重新预下载
+            if (ReadBook.durChapterIndex != baseIndex) return
+            // 持续故障熔断: 预下载失败达阈值即中止本轮, 不再逐段空请求
+            if (preDownloadErrorNo.get() >= ttsPreDownloadErrorLimit) return
+            val textChapter = when {
+                offset > 1 -> loadTextChapter(book, baseIndex + offset)
+                // 排版完成的下一章可直接使用; 未完成时另行本地排版, 避免与排版线程并发读写 pages
+                nextTextChapter?.isCompleted == true -> nextTextChapter
+                preDownloadNum == 0 -> return
+                else -> loadTextChapter(book, baseIndex + 1)
+            } ?: continue
+            // 第 N+1 章只预下载开头(前2页), 其余整章预下载
+            val pageEndIndex = if (offset == preDownloadNum + 1) 1 else textChapter.pages.lastIndex
+            textChapter.getNeedReadAloud(0, readAloudByPage, 0, pageEndIndex)
+                .splitToSequence("\n")
+                .filter { it.isNotEmpty() }
+                .forEach { content ->
+                    ensureActive()
+                    if (preDownloadErrorNo.get() >= ttsPreDownloadErrorLimit) return
+                    val fileName = md5SpeakFileName(content, textChapter)
+                    val speakText = content.replace(AppPattern.notReadAloudRegex, "")
+                    // 空段落由播放时按需写入无声音频; 相同文本会算出同一缓存 key, 跨任务去重避免重复下载
+                    if (speakText.isEmpty() || !downloadedKeys.add(fileName)) return@forEach
+                    submit(
+                        fileName,
+                        createDownloader(createDataSourceFactory(httpTts, speakText, true), fileName)
+                    )
+                }
         }
+    }
+
+    /** 加载并排版远章供预下载; 正文缺失/获取失败/含图片(排版会顺带批量下载图片)时返回 null */
+    private suspend fun CoroutineScope.loadTextChapter(
+        book: Book,
+        chapterIndex: Int
+    ): TextChapter? {
+        val chapter = ReadBook.chapterList?.getOrNull(chapterIndex) ?: return null
+        val content = BookHelp.getContent(book, chapter)
+            ?: ReadBook.bookSource?.let { source ->
+                try {
+                    WebBook.getContentAwait(source, book, chapter)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            ?: return null
+        if (content.contains("<img", ignoreCase = true)) return null
+        // 与播放侧同链路排版, 保证段落切分与缓存 key 一致
+        val textChapter = ReadBook.typesetChapterAsync(this, book, chapter, content)
+        return runCatching {
+            // 消费排版分页直至通道正常关闭(即排版完成), 不读 isCompleted 避免标志位可见性竞态
+            for (page in textChapter.layoutChannel) {
+            }
+            textChapter
+        }.onFailure {
+            if (it is CancellationException) throw it
+            AppLog.put("TTS预下载排版远章失败\n${it.localizedMessage}", it)
+        }.getOrNull()
     }
 
     private fun createDataSourceFactory(
         httpTts: HttpTTS,
-        speakText: String
+        speakText: String,
+        isPreDownload: Boolean = false
     ): CacheDataSource.Factory {
         // 同一段落的流与重放缓冲在多次 open 间共享,
         // MediaParser 嗅探后重新 open 时从缓冲重放, 避免对 TTS 服务器重复请求
@@ -440,17 +548,23 @@ class HttpReadAloudService : BaseReadAloudService(),
             } else {
                 kotlin.runCatching {
                     runBlocking(lifecycleScope.coroutineContext[Job]!!) {
-                        getSpeakStream(httpTts, speakText)
+                        getSpeakStream(httpTts, speakText, !isPreDownload)
                     }
                 }.onFailure {
                     when (it) {
                         is InterruptedException,
                         is CancellationException -> Unit
 
-                        else -> pauseReadAloud()
+                        // 预下载失败不暂停朗读, 由播放到该段落时按需重试
+                        else -> if (!isPreDownload) pauseReadAloud()
                     }
                 }.getOrThrow()
-            } ?: resources.openRawResource(R.raw.silent_sound)
+            } ?: if (isPreDownload) {
+                // 预下载语境不允许静音占位入缓存, 获取不到音频流直接失败, 交由调用方释放 key 重试
+                throw NoStackTraceException("TTS预下载获取音频流失败")
+            } else {
+                resources.openRawResource(R.raw.silent_sound)
+            }
         })
         val upstreamFactory = DataSource.Factory {
             InputStreamDataSource({ replayBuffer.streamAt(0) }, replayBuffer)
@@ -478,7 +592,8 @@ class HttpReadAloudService : BaseReadAloudService(),
 
     private suspend fun getSpeakStream(
         httpTts: HttpTTS,
-        speakText: String
+        speakText: String,
+        countError: Boolean = true
     ): InputStream? {
         while (true) {
             try {
@@ -513,20 +628,25 @@ class HttpReadAloudService : BaseReadAloudService(),
                 }
                 currentCoroutineContext().ensureActive()
                 response.body.byteStream().let { stream ->
-                    // 下载成功, 清零连续错误计数
-                    downloadErrorNo.set(0)
+                    // 下载成功, 清零连续错误计数(预下载语境不参与播放熔断计数)
+                    if (countError) {
+                        downloadErrorNo.set(0)
+                    }
                     return stream
                 }
             } catch (e: Exception) {
                 when (e) {
                     is CancellationException -> throw e
                     is ScriptException, is WrappedException -> {
-                        AppLog.put("js错误\n${e.localizedMessage}", e, true)
+                        // 预下载语境不弹 toast, 失败次数由预下载熔断计数兜底
+                        AppLog.put("js错误\n${e.localizedMessage}", e, countError)
                         e.printOnDebug()
                         throw e
                     }
 
                     is SocketTimeoutException, is ConnectException -> {
+                        // 预下载语境不计数不重试, 直接失败该段, 由调用方释放缓存 key 供后续重试
+                        if (!countError) throw e
                         if (downloadErrorNo.incrementAndGet() > 5) {
                             val msg = "tts超时或连接错误超过5次\n${e.localizedMessage}"
                             AppLog.put(msg, e, true)
@@ -535,6 +655,8 @@ class HttpReadAloudService : BaseReadAloudService(),
                     }
 
                     else -> {
+                        // 预下载语境不计数不重试, 直接失败该段, 由调用方释放缓存 key 供后续重试
+                        if (!countError) throw e
                         val msg = "tts下载错误\n${e.localizedMessage}"
                         AppLog.put(msg, e)
                         e.printOnDebug()
@@ -543,10 +665,9 @@ class HttpReadAloudService : BaseReadAloudService(),
                             val msg1 = "TTS服务器连续5次错误，已暂停阅读。"
                             AppLog.put(msg1, e, true)
                             throw e
-                        } else {
-                            AppLog.put("TTS下载音频出错，使用无声音频代替。\n朗读文本：$speakText")
-                            break
                         }
+                        AppLog.put("TTS下载音频出错，使用无声音频代替。\n朗读文本：$speakText")
+                        break
                     }
                 }
             }
@@ -558,51 +679,11 @@ class HttpReadAloudService : BaseReadAloudService(),
         content: String,
         textChapter: TextChapter? = this.textChapter
     ): String {
+        // key 剔除段评占位符: 计数随排版路径/时间变化, 保留会使同一段落 key 漂移导致缓存永不命中
+        val keyContent = content.replace(ChapterProvider.reviewChar, "")
         return MD5Utils.md5Encode16(textChapter?.title ?: "") + "_" +
-                MD5Utils.md5Encode16("${ReadAloud.httpTTS?.url}-|-$speechRate-|-$content")
+                MD5Utils.md5Encode16("${ReadAloud.httpTTS?.url}-|-$speechRate-|-$keyContent")
     }
-
-    private fun createSilentSound(fileName: String) {
-        val file = createSpeakFile(fileName)
-        file.writeBytes(resources.openRawResource(R.raw.silent_sound).readBytes())
-    }
-
-    private fun hasSpeakFile(name: String): Boolean {
-        return FileUtils.exist("${ttsFolderPath}$name.mp3")
-    }
-
-    private fun getSpeakFileAsMd5(name: String): File {
-        return File("${ttsFolderPath}$name.mp3")
-    }
-
-    private fun createSpeakFile(name: String): File {
-        return FileUtils.createFileIfNotExist("${ttsFolderPath}$name.mp3")
-    }
-
-    private fun createSpeakFile(name: String, inputStream: InputStream) {
-        FileUtils.createFileIfNotExist("${ttsFolderPath}$name.mp3").outputStream().use { out ->
-            inputStream.use {
-                it.copyTo(out)
-            }
-        }
-    }
-
-    /**
-     * 移除缓存文件
-     */
-    private fun removeCacheFile() {
-        val titleMd5 = MD5Utils.md5Encode16(textChapter?.title ?: "")
-        FileUtils.listDirsAndFiles(ttsFolderPath)?.forEach {
-            val isSilentSound = it.length() == 2160L
-            if ((!it.name.startsWith(titleMd5)
-                        && System.currentTimeMillis() - it.lastModified() > 600000)
-                || isSilentSound
-            ) {
-                FileUtils.delete(it.absolutePath)
-            }
-        }
-    }
-
 
     override fun pauseReadAloud(abandonFocus: Boolean) {
         super.pauseReadAloud(abandonFocus)
@@ -755,8 +836,8 @@ class HttpReadAloudService : BaseReadAloudService(),
             return
         }
         val mediaItem = exoPlayer.currentMediaItem ?: return
-        val filePath = mediaItem.localConfiguration!!.uri.path!!
-        File(filePath).delete()
+        // 播放出错的段落缓存已损坏, 移除缓存资源以便重试重新下载
+        cache.removeResource(mediaItem.localConfiguration!!.uri.toString())
     }
 
     override fun aloudServicePendingIntent(actionStr: String): PendingIntent? {

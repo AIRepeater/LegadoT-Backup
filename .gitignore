@@ -18,4 +18,11 @@ package-lock.json
 .kotlin/
 .vscode
 .proxyai
+
+# 个人/Agent 协作文档（不入版本库）
 项目文档.md
+项目指导文档.md
+_*.md
+_*.txt
+.pre2205.kt
+.zcode/

@@ -842,6 +842,18 @@ object ReadBook : CoroutineScope by MainScope() {
     }
 
     /**
+     * 供在线朗读远章预下载复用: 与正文加载同链路排版, 保证朗读段落切分与缓存 key 一致
+     */
+    fun typesetChapterAsync(
+        scope: CoroutineScope,
+        book: Book,
+        chapter: BookChapter,
+        content: String
+    ): TextChapter {
+        return scope.processContent(book, chapter, content)
+    }
+
+    /**
      * 与正文加载并行启动段评数 IO，按 chapter.index 复用 Deferred。
      * 返回 null 表示不需要拉。
      */

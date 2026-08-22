@@ -151,6 +151,7 @@ object PreferKey {
     const val recordHeapDump = "recordHeapDump"
     const val updateToVariant = "updateToVariant"
     const val streamReadAloudAudio = "streamReadAloudAudio"
+    const val ttsPreDownloadChapterNum = "ttsPreDownloadChapterNum"
     const val pauseReadAloudWhilePhoneCalls = "pauseReadAloudWhilePhoneCalls"
     const val readAloudByMediaButton = "readAloudByMediaButton"
     const val devFeat = "devFeat"

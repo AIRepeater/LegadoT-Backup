@@ -245,6 +245,9 @@ object AppConfig : SharedPreferences.OnSharedPreferenceChangeListener {
     val defaultHomePage by stringPref(PreferKey.defaultHomePage, "bookshelf")
     val updateToVariant by stringPref(PreferKey.updateToVariant, "default_version")
     val streamReadAloudAudio by boolPref(PreferKey.streamReadAloudAudio, false)
+
+    /** 在线朗读预下载章数, 0 为仅预下载下一章开头(历史行为) */
+    var ttsPreDownloadChapterNum by intPref(PreferKey.ttsPreDownloadChapterNum, 0, 0..50)
     val doublePageHorizontal by stringPref(PreferKey.doublePageHorizontal)
     val progressBarBehavior by stringPref(PreferKey.progressBarBehavior, "page")
     val volumeKeyPage by boolPref(PreferKey.volumeKeyPage, true)

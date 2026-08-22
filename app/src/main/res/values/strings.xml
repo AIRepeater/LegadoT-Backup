@@ -1016,6 +1016,11 @@
     <string name="scroll_to_dur_source">Navigate to the current book source</string>
     <string name="sys_tts_config">System tts Settings</string>
     <string name="sys_tts_config_summary">Open the system tts settings interface</string>
+    <string name="tts_pre_download">TTS pre-download chapters</string>
+    <string name="tts_pre_download_s">Pre-download %s chapters of audio (0 = next chapter opening only)</string>
+    <string name="clear_tts_cache">Clear TTS cache</string>
+    <string name="clear_tts_cache_summary">Delete cached online read-aloud audio</string>
+    <string name="clear_tts_cache_confirm">This will delete all cached online read-aloud audio, stopping online read-aloud if in progress. Continue?</string>
     <string name="cannot_timed_non_playback">When the non-playback state is not legal</string>
     <string name="all_bookmark">All bookmarks</string>
     <string name="change_source_batch">Batch source switching</string>

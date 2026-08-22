@@ -67,6 +67,18 @@
             android:key="sysTtsConfig"
             app:iconSpaceReserved="false" />
 
+        <io.legado.app.lib.prefs.Preference
+            android:title="@string/tts_pre_download"
+            android:summary="@string/tts_pre_download_s"
+            android:key="ttsPreDownloadChapterNum"
+            app:iconSpaceReserved="false" />
+
+        <io.legado.app.lib.prefs.Preference
+            android:title="@string/clear_tts_cache"
+            android:summary="@string/clear_tts_cache_summary"
+            android:key="clearTtsCache"
+            app:iconSpaceReserved="false" />
+
     </io.legado.app.lib.prefs.PreferenceCategory>
 
 </androidx.preference.PreferenceScreen>
